@@ -136,9 +136,24 @@ audit-gate:
 
 其余字段（`commands`/`scope`/`workdir`/`mutatingTools`/`registerTool`/`toolName`）仍属组合配置，改动需重载。
 
+### 斜杠命令（查看 / 切换开关）
+
+插件注册两个人类命令，直接改上面的 settings 命名空间、即时生效：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/audit` | 查看当前开关状态（`enabled` / `guardCompletion` / `guardTurnEnd` / `maxAttempts` / 套件数量） |
+| `/audit-toggle [on\|off]` | 开/关总开关；不带参数则翻转 |
+
+```
+/audit             # → Audit gate: enabled: true, guardTurnEnd: modified, …
+/audit-toggle off  # → 关闭自动闸门（run_audit 手动工具仍可用）
+/audit-toggle      # → 再翻转一次 = 重新打开
+```
+
 > Web 端可视化开关：DSH 的设置 UI 是 slot 驱动、由每个插件自带 client 半区渲染（`settings.general.item`
-> 或 `settings.section`）。当前本包只注册了 host 侧 settings 命名空间（热切换骨架已就绪），
-> 若要在设置页出现可点击的开关/下拉框，需要再补一个 client 半区把该命名空间渲染成 schema 表单。
+> 或 `settings.section`）。当前本包提供 `/audit`、`/audit-toggle` 命令 + host 侧 settings 命名空间（热切换已就绪），
+> 若还要在设置页出现可点击的开关/下拉框，需再补一个 client 半区把该命名空间渲染成 schema 表单。
 
 每个 `commands[]` 项：
 
