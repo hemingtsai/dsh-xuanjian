@@ -12,6 +12,8 @@
     guardTurnEnd: modified           # off | modified | always
     scope: root                      # root | all
     maxAttempts: 5
+    registerTool: true               # register the model-facing `run_audit` tool
+    toolName: run_audit
     # workdir: ~                     # optional override; defaults to the agent's cwd
     mutatingTools:
       - write

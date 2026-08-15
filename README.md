@@ -10,7 +10,8 @@
 
 ## 1. 工作原理
 
-DSH 里「任务完成」有两个落地信号，本插件对应两个互补的闸门（gate），共用同一个审计执行器：
+DSH 里「任务完成」有两个落地信号，本插件对应两个互补的闸门（gate）加一个主动验证工具（tool），
+共用同一个审计执行器（带按 agent 的缓存，代码没变时不会重复全量跑）：
 
 ```
                  ┌────────────────────────────────────────────┐
@@ -21,8 +22,10 @@ DSH 里「任务完成」有两个落地信号，本插件对应两个互补的�
                  │                                            │
                  │  (B) agent/turn-stopping ──> 无 goal 任务    │
                  │      注入修复提示，turn 不结束               │
+                 │                                            │
+  model ────────>│  (C) run_audit tool ──> 主动自查 + 结构化报告 │
                  └───────────────┬────────────────────────────┘
-                                 │  runAudit(commands)
+                                 │  runAuditCached(commands)
                                  ▼
                     ctx.bash.run("npm run lint" | "npx tsc --noEmit" | "npm test" ...)
 ```
@@ -52,6 +55,14 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 5. 循环直到通过；用 `maxAttempts` 和「无进展指纹」双重兜底，防止死循环。
 
 > 有 active/completed goal 时，(B) 自动让位给 (A)，避免重复审计。
+
+### (C) 主动验证工具 `run_audit`（可选，默认开启）
+
+插件还会注册一个 `run_audit` 工具（`registerTool: true`，名字可改 `toolName`）：模型在
+标记完成**之前**主动调用它跑同一套审计，拿到结构化报告（`passed` / `summary` / `results[]`）。
+一方面减少“试 `complete` 被拒”的往返，另一方面结果会写入缓存——随后同一次 turn 内模型
+再 `complete`，闸门 (A) 直接复用缓存，不再重复全量跑。缓存以“代码是否被改动”为失效条件：
+模型一旦 `write`/`edit`/`bash`/`pwsh` 改了东西，缓存自动作废、下次重跑。
 
 ---
 
@@ -105,7 +116,9 @@ npm install <this-package>
 | `scope` | `root\|all` | `root` | 只对顶层 agent 生效，还是含 subagent |
 | `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示 |
 | `workdir` | string | agent cwd | 审计工作目录覆盖 |
-| `mutatingTools` | string[] | `write,edit,bash,pwsh` | `modified` 触发判定用到的“会改文件”工具名 |
+| `mutatingTools` | string[] | `write,edit,bash,pwsh` | `modified` 触发判定 + 缓存失效判定用到的“会改文件”工具名 |
+| `registerTool` | bool | `true` | 是否注册 (C) 主动验证工具 |
+| `toolName` | string | `run_audit` | 主动验证工具的模型可见名称 |
 | `commands[]` | object[] | `[]` | 审计套件 |
 
 每个 `commands[]` 项：
@@ -127,6 +140,8 @@ npm install <this-package>
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
   turn 被中止时审计命令会被 kill。
 - **无进展检测**：闸门 (B) 对每次失败做「失败项+输出」指纹，若与上一轮一致（模型没实际改好），立即停止注入，避免空转。
+- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存；模型代码（`write`/`edit`/`bash`/`pwsh`）一有改动
+  （`dirtyVersion` 递增）缓存即失效，`turn/start` 也会清缓存。因此“先 `run_audit` 通过、再 `complete`”不会重复全量跑。
 - **反馈来源**：注入的消息 `source.kind = "plugin"`（非 `"user"`），因此不会被 goal 系统的
   `hasDirectHumanInput` 误判为「人类直接输入」，不会意外获得本不该有的权限。
 - **生命周期**：监听器和 per-agent 状态随 fiber/agent 自动清理，无进程级残留副作用。
@@ -138,12 +153,10 @@ npm install <this-package>
 1. **goal 的“完成前拦截”是借 `tools/pre-execute` 实现的**（今天无需改内核即可工作，且语义正确）。
    若希望更通用的“任何路径写 complete 都被拦”的钩子，可向 `@deepseek-ai/dsh-goal` 提议增加一个
    `goal/pre-complete` waterfall 事件，插件改为监听该事件即可。
-2. **审计成本**：`complete` 每次重试都会全量重跑。可在插件内加“同 turn 无改动则复用上次结果”的缓存优化。
-3. **写产物类检查**（如 `build`）受部署 sandbox/文件策略约束；若部署为只读，写产物命令会被策略拒绝，
+2. **写产物类检查**（如 `build`）受部署 sandbox/文件策略约束；若部署为只读，写产物命令会被策略拒绝，
    可改用只读检查（`--noEmit`、`lint`、`test`）。
-4. **主动验证工具**（可选扩展）：可再注册一个 `run_audit` 工具，让模型在完成前主动跑同一套件、
-   提前看到结果，减少“试 complete 被拒”的往返。
-5. **report/结构化输出**：目前反馈是文本摘要；可扩展为结构化 JSON（检查项、文件、行列、修复建议）供模型更精准修复。
+3. **结构化到文件/行号级**：当前 `run_audit` 报告与 gate 反馈是「检查项 + 退出码 + 输出摘要」；
+   可进一步解析 lint/test 输出为 `文件 / 行号 / 修复建议` 的结构化 JSON，供模型更精准修复。
 
 ---
 
