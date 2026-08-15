@@ -1,0 +1,41 @@
+# Example preset row for `dsh-audit-gate`.
+#
+# Drop this row into your agent preset's `agent.cordis.yml` (the plugin
+# publishes no service, so it may sit loose in a preset like `tool-bash`).
+# Adjust `commands` to your project's real verification suite.
+
+- id: audit-gate
+  name: dsh-audit-gate
+  config:
+    enabled: true
+    guardCompletion: true            # deny `update_goal` complete until verified
+    guardTurnEnd: modified           # off | modified | always
+    scope: root                      # root | all
+    maxAttempts: 5
+    # workdir: ~                     # optional override; defaults to the agent's cwd
+    mutatingTools:
+      - write
+      - edit
+      - bash
+      - pwsh
+    commands:
+      - name: lint
+        run: npm run lint
+        timeoutMs: 120000
+        required: true
+        maxOutputChars: 4000
+      - name: typecheck
+        run: npx tsc --noEmit
+        timeoutMs: 120000
+        required: true
+        maxOutputChars: 4000
+      - name: test
+        run: npm test -- --run
+        timeoutMs: 300000
+        required: true
+        maxOutputChars: 6000
+      # Optional non-blocking check: failure is reported but does not block completion.
+      # - name: audit-deps
+      #   run: npm audit --audit-level=high
+      #   required: false
+      #   timeoutMs: 60000

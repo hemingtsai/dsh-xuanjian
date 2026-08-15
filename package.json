@@ -1,0 +1,36 @@
+{
+  "name": "dsh-audit-gate",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness completion gate: full code audit + verification before a task can finish, with automatic feedback and fix loops.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "author": "hemingtsai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hemingtsai/dsh-xuanjian.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "audit",
+    "verification",
+    "ci",
+    "lint"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}
