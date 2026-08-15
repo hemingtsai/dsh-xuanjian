@@ -110,16 +110,35 @@ npm install <this-package>
 
 | 键 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | 总开关 |
-| `guardCompletion` | bool | `true` | 闸门 (A)：拒绝未通过审计的 `update_goal complete` |
-| `guardTurnEnd` | `off\|modified\|always` | `modified` | 闸门 (B)：turn 结束审计的触发条件 |
+| `enabled` | bool | `true` | 总开关（**运行时热切换**） |
+| `guardCompletion` | bool | `true` | 闸门 (A)：拒绝未通过审计的 `update_goal complete`（**运行时热切换**） |
+| `guardTurnEnd` | `off\|modified\|always` | `modified` | 闸门 (B)：turn 结束审计的触发条件（**运行时热切换**） |
 | `scope` | `root\|all` | `root` | 只对顶层 agent 生效，还是含 subagent |
-| `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示 |
+| `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示（**运行时热切换**） |
 | `workdir` | string | agent cwd | 审计工作目录覆盖 |
 | `mutatingTools` | string[] | `write,edit,bash,pwsh` | `modified` 触发判定 + 缓存失效判定用到的“会改文件”工具名 |
 | `registerTool` | bool | `true` | 是否注册 (C) 主动验证工具 |
 | `toolName` | string | `run_audit` | 主动验证工具的模型可见名称 |
 | `commands[]` | object[] | `[]` | 审计套件 |
+
+### 运行时开关（settings）
+
+`enabled` / `guardCompletion` / `guardTurnEnd` / `maxAttempts` 注册为 **`audit-gate` 设置命名空间**
+（`@deepseek-ai/dsh-settings`），可在**不编辑组合、不重启**的情况下热切换，层级为
+`schema 默认 ← 组合 entry ← 用户 settings 层`。改 `~/.dsh/settings.yaml` 里的 `audit-gate:` 段即生效：
+
+```yaml
+audit-gate:
+  enabled: false          # 一键关闭全部自动闸门（run_audit 手动工具仍可用）
+  guardTurnEnd: off       # 或只关 turn 结束闸门
+  maxAttempts: 3
+```
+
+其余字段（`commands`/`scope`/`workdir`/`mutatingTools`/`registerTool`/`toolName`）仍属组合配置，改动需重载。
+
+> Web 端可视化开关：DSH 的设置 UI 是 slot 驱动、由每个插件自带 client 半区渲染（`settings.general.item`
+> 或 `settings.section`）。当前本包只注册了 host 侧 settings 命名空间（热切换骨架已就绪），
+> 若要在设置页出现可点击的开关/下拉框，需要再补一个 client 半区把该命名空间渲染成 schema 表单。
 
 每个 `commands[]` 项：
 
