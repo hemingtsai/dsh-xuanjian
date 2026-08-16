@@ -75,6 +75,13 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 npm install <this-package>
 ```
 
+> **peer 依赖约定**：`@deepseek-ai/dsh-llm` / `dsh-tools` / `dsh-settings` / `dsh-shell` / `cordis`
+> 声明为 **peerDependencies**，由宿主 harness 提供（与 `tool-bash`、`tool-goal` 等官方插件一致）。
+> 切勿把它们列进 `dependencies`：那会让 pnpm 往 profile 的 `node_modules` 里塞进**第二份**
+> `dsh-tools`，它会在 loader 以 profile 为 baseUrl 解析时遮蔽扁平回退副本，造成两份模块实例、
+> `TOOL_RUNTIME_SCHEDULER` symbol 不一致，最终所有工具调度都以
+> `Cannot read properties of undefined (reading 'prepare')` 崩溃。只把第三方库（如 `schemastery`）放 dependencies。
+
 在预设的 `agent.cordis.yml`（或 host 组合）里加一行。它**不发布任何 service**，因此可以像
 `tool-bash` 一样松散地放在 preset 里：
 
