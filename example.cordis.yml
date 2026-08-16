@@ -2,7 +2,9 @@
 #
 # Drop this row into your agent preset's `agent.cordis.yml` (the plugin
 # publishes no service, so it may sit loose in a preset like `tool-bash`).
-# Adjust `commands` to your project's real verification suite.
+# The audit is a cheap-model subagent (`auditModel`) that generates and runs
+# the language-appropriate checks itself, reviews code style, and checks
+# documentation coverage.
 
 - id: audit-gate
   name: dsh-audit-gate
@@ -10,7 +12,6 @@
     enabled: true
     guardCompletion: true            # deny `update_goal` complete until verified
     guardTurnEnd: modified           # off | modified | always
-    scope: root                      # root | all
     maxAttempts: 5
     registerTool: true               # register the model-facing `run_audit` tool
     toolName: run_audit
@@ -20,24 +21,9 @@
       - edit
       - bash
       - pwsh
-    commands:
-      - name: lint
-        run: npm run lint
-        timeoutMs: 120000
-        required: true
-        maxOutputChars: 4000
-      - name: typecheck
-        run: npx tsc --noEmit
-        timeoutMs: 120000
-        required: true
-        maxOutputChars: 4000
-      - name: test
-        run: npm test -- --run
-        timeoutMs: 300000
-        required: true
-        maxOutputChars: 6000
-      # Optional non-blocking check: failure is reported but does not block completion.
-      # - name: audit-deps
-      #   run: npm audit --audit-level=high
-      #   required: false
-      #   timeoutMs: 60000
+    auditProvider: deepseek-official # provider serving the cheap audit subagent
+    auditModel: deepseek-v4-flash    # cheap model that performs the audit
+    subagentProvider: spawn          # subagent provider to spawn the audit with
+    checkStyle: true                 # have the audit review code style
+    checkDocs: true                  # have the audit check documentation coverage
+    # styleGuide: .editorconfig      # optional style-guide file (absolute or workspace-relative)

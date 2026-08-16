@@ -1,17 +1,18 @@
 # 让任务在完成前先通过全量审计 —— `dsh-audit-gate`
 
-一个 DeepSeek Harness（DSH）插件：**当模型声称「任务完成」时，先对代码做全量审计与验证；验证不通过就把失败信息反馈给模型让它修复，修复后再审计，直到通过才真正结束这个 task。**
+一个 DeepSeek Harness（DSH）插件：**当模型声称「任务完成」时，先用廉价模型 subagent 对代码做全量审计；审计不通过就把失败信息反馈给模型让它修复，修复后再审计，直到通过才真正结束这个 task。**
 
-- 全量审计 = 可配置的 shell 命令套件（`lint` / `typecheck` / `test` / `build` / 任意脚本）。
-- 反馈修复 = 失败输出自动回到模型当前 turn，模型继续改，改完 gate 自动重跑。
-- 结束门槛 = 只有必选检查全部通过（或触达安全上限）任务才真正结束。
+- **审计 = 自动生成**：按项目语言，由审计 subagent 自己生成并运行合适的检查（lint / typecheck / test / build / 等价命令）。
+- **廉价模型**：审计 subagent 默认用 `deepseek-v4-flash`（远便宜于任务的 `deepseek-v4-pro`），一次 LLM 往返完成「生成检查 + 跑检查 + 审风格 + 查文档覆盖」。
+- **反馈修复** = 失败输出自动回到模型当前 turn，模型继续改，改完 gate 自动重跑。
+- **结束门槛** = 只要还有必选检查失败，任务就不能真正结束（受 `maxAttempts` 与「无进展指纹」双重兜底）。
 
 ---
 
 ## 1. 工作原理
 
 DSH 里「任务完成」有两个落地信号，本插件对应两个互补的闸门（gate）加一个主动验证工具（tool），
-共用同一个审计执行器（带按 agent 的缓存，代码没变时不会重复全量跑）：
+共用同一个审计执行器（按 agent 缓存，代码没变时不会重复开 subagent）：
 
 ```
                  ┌────────────────────────────────────────────┐
@@ -25,9 +26,13 @@ DSH 里「任务完成」有两个落地信号，本插件对应两个互补的�
                  │                                            │
   model ────────>│  (C) run_audit tool ──> 主动自查 + 结构化报告 │
                  └───────────────┬────────────────────────────┘
-                                 │  runAuditCached(commands)
+                                 │  runAuditCached(agent, signal)
                                  ▼
-                    ctx.shell.run("npm run lint" | "npx tsc --noEmit" | "npm test" ...)
+                  ctx.subagents.start("spawn", {
+                    agentOptions: { model: auditModel },   // 默认 deepseek-v4-flash
+                    outputSchema: verdict,                  // 结构化裁决
+                  })   ──>  审计 subagent：生成检查并执行
+                             + 审代码风格 + 查文档覆盖
 ```
 
 ### (A) 目标类任务的「完成闸门」（精确、保语义）
@@ -36,11 +41,10 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 `tools/pre-execute`（waterfall，可异步），当工具是 `update_goal` 且 action 为 `complete` 时：
 
 1. 先跑完整审计（`await`，阻塞在工具执行前）。
-2. 全部必选检查通过 → `next()`，放行，goal 正常进入 `complete`。
+2. 全部检查通过 → `next()`，放行，goal 正常进入 `complete`。
 3. 有失败 → 返回 `{ kind: "deny", reason: <失败摘要> }`，工具调用被拒绝，goal **不会被标记 complete**。
 
-模型看到 `update_goal` 返回错误（含失败明细），继续修复，再重试 `complete`。这样 goal 的
-「complete 才代表真的做完」语义被严格保留，不需要事后“反悔”已完成的 goal。
+模型看到 `update_goal` 返回错误（含失败明细），继续修复，再重试 `complete`。
 
 ### (B) 非目标类任务的「turn 结束闸门」（通用兜底）
 
@@ -49,20 +53,25 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 
 1. 模型停手、turn 即将关闭时触发。
 2. 按 `guardTurnEnd` 触发条件决定是否审计（默认 `modified`：仅当本 turn 改过文件）。
-3. 审计通过 → 什么都不做，turn 正常关闭（任务结束）。
-4. 审计失败 → 用 `agent.steer(...)` 把失败摘要注入当前 turn 的下一个 step，
-   **机器会重读 inbox、再跑一个 step**，模型据此修复；修完停手又触发 `agent/turn-stopping`，自动重跑审计。
+3. 审计通过 → 什么都不做，turn 正常关闭。
+4. 审计失败 → 用 `agent.steer(...)` 把失败摘要注入当前 turn 的下一个 step，机器重读 inbox、再跑一个 step，
+   模型据此修复；修完停手又触发，自动重跑。
 5. 循环直到通过；用 `maxAttempts` 和「无进展指纹」双重兜底，防止死循环。
 
 > 有 active/completed goal 时，(B) 自动让位给 (A)，避免重复审计。
 
 ### (C) 主动验证工具 `run_audit`（可选，默认开启）
 
-插件还会注册一个 `run_audit` 工具（`registerTool: true`，名字可改 `toolName`）：模型在
-标记完成**之前**主动调用它跑同一套审计，拿到结构化报告（`passed` / `summary` / `results[]`）。
-一方面减少“试 `complete` 被拒”的往返，另一方面结果会写入缓存——随后同一次 turn 内模型
-再 `complete`，闸门 (A) 直接复用缓存，不再重复全量跑。缓存以“代码是否被改动”为失效条件：
-模型一旦 `write`/`edit`/`bash`/`pwsh` 改了东西，缓存自动作废、下次重跑。
+插件注册一个 `run_audit` 工具：模型在标记完成**之前**主动调用它跑同一套审计，拿到结构化报告
+（`passed` / `summary` / `results[]`），减少「试 `complete` 被拒」的往返。结果写入缓存，
+同一次 turn 内模型再 `complete`，闸门 (A) 直接复用，不再重复开 subagent。
+缓存以「代码是否被改动」为失效条件：模型一旦 `write`/`edit`/`bash`/`pwsh` 改了东西，缓存自动作废、下次重跑。
+
+### 递归安全
+
+审计本身就是 subagent，而 subagent 会继承父级 preset（可能再次装上本插件）。因此审计**只对顶层 agent
+（`delegationDepth` 0）执行**：任何 gate 或 `run_audit` 工具若由 subagent 触发，都会得到一个
+「仅适用于顶层 agent」的非阻断裁决。这样审计子 agent 永远不可能审计它自己。
 
 ---
 
@@ -75,8 +84,8 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 npm install <this-package>
 ```
 
-> **peer 依赖约定**：`@deepseek-ai/dsh-llm` / `dsh-tools` / `dsh-settings` / `dsh-shell` / `cordis`
-> 声明为 **peerDependencies**，由宿主 harness 提供（与 `tool-bash`、`tool-goal` 等官方插件一致）。
+> **peer 依赖约定**：`@deepseek-ai/dsh-llm` / `dsh-tools` / `dsh-settings` / `cordis` 声明为
+> **peerDependencies**，由宿主 harness 提供（与 `tool-bash`、`tool-goal` 等官方插件一致）。
 > 切勿把它们列进 `dependencies`：那会让 pnpm 往 profile 的 `node_modules` 里塞进**第二份**
 > `dsh-tools`，它会在 loader 以 profile 为 baseUrl 解析时遮蔽扁平回退副本，造成两份模块实例、
 > `TOOL_RUNTIME_SCHEDULER` symbol 不一致，最终所有工具调度都以
@@ -90,26 +99,17 @@ npm install <this-package>
   name: dsh-audit-gate
   config:
     guardTurnEnd: modified      # off | modified | always
-    scope: root                 # root | all
     maxAttempts: 5
-    commands:
-      - name: lint
-        run: npm run lint
-        timeoutMs: 120000
-      - name: typecheck
-        run: npx tsc --noEmit
-        timeoutMs: 120000
-      - name: test
-        run: npm test -- --run
-        timeoutMs: 300000
+    auditProvider: deepseek-official
+    auditModel: deepseek-v4-flash
+    subagentProvider: spawn
+    checkStyle: true
+    checkDocs: true
+    # styleGuide: .editorconfig   # 可选：绝对路径或相对工作区的风格指南文件
 ```
 
-完整示例见 [`example.cordis.yml`](./example.cordis.yml)。
-
 > 推荐放在**预设（agent 平面）**：`agent/turn-stopping`、`tools/pre-execute` 都是按 scope 向上路由的
-> 事件，站在 preset 的 standing scope 上能收到其下所有 session 的事件（`@deepseek-ai/dsh-scope`
-> 的 `scopeTarget`：「listener owned by an enclosing scope receives every descendant scope's events」）。
-> 放在 host 平面（unscoped）同样能收到全部 agent，二选一即可。
+> 事件，站在 preset 的 standing scope 上能收到其下所有 session 的事件。放在 host 平面（unscoped）同样能收到全部 agent，二选一即可。
 
 ---
 
@@ -120,19 +120,23 @@ npm install <this-package>
 | `enabled` | bool | `true` | 总开关（**运行时热切换**） |
 | `guardCompletion` | bool | `true` | 闸门 (A)：拒绝未通过审计的 `update_goal complete`（**运行时热切换**） |
 | `guardTurnEnd` | `off\|modified\|always` | `modified` | 闸门 (B)：turn 结束审计的触发条件（**运行时热切换**） |
-| `scope` | `root\|all` | `root` | 只对顶层 agent 生效，还是含 subagent |
 | `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示（**运行时热切换**） |
 | `workdir` | string | agent cwd | 审计工作目录覆盖 |
 | `mutatingTools` | string[] | `write,edit,bash,pwsh` | `modified` 触发判定 + 缓存失效判定用到的“会改文件”工具名 |
 | `registerTool` | bool | `true` | 是否注册 (C) 主动验证工具 |
 | `toolName` | string | `run_audit` | 主动验证工具的模型可见名称 |
-| `commands[]` | object[] | `[]` | 审计套件 |
+| `auditProvider` | string | `deepseek-official` | 审计 subagent 的 provider |
+| `auditModel` | string | `deepseek-v4-flash` | 审计 subagent 的廉价模型 |
+| `subagentProvider` | string | `spawn` | 审计 subagent 的 provider 名 |
+| `checkStyle` | bool | `true` | 审计是否审代码风格 |
+| `checkDocs` | bool | `true` | 审计是否查文档覆盖 |
+| `styleGuide` | string | — | 可选风格指南文件（绝对或相对工作区）；存在则注入审计 prompt |
 
 ### 运行时开关（settings）
 
 `enabled` / `guardCompletion` / `guardTurnEnd` / `maxAttempts` 注册为 **`audit-gate` 设置命名空间**
-（`@deepseek-ai/dsh-settings`），可在**不编辑组合、不重启**的情况下热切换，层级为
-`schema 默认 ← 组合 entry ← 用户 settings 层`。改 `~/.dsh/settings.yaml` 里的 `audit-gate:` 段即生效：
+（`@deepseek-ai/dsh-settings`），可在不编辑组合、不重启的情况下热切换。改 `~/.dsh/settings.yaml`
+里的 `audit-gate:` 段即生效：
 
 ```yaml
 audit-gate:
@@ -141,63 +145,46 @@ audit-gate:
   maxAttempts: 3
 ```
 
-其余字段（`commands`/`scope`/`workdir`/`mutatingTools`/`registerTool`/`toolName`）仍属组合配置，改动需重载。
+其余字段（审计模型、provider、风格/文档开关、styleGuide 等）仍属组合配置，改动需重载。
 
 ### 斜杠命令（查看 / 切换开关）
 
-插件注册两个人类命令，直接改上面的 settings 命名空间、即时生效：
-
 | 命令 | 作用 |
 | --- | --- |
-| `/audit` | 查看当前开关状态（`enabled` / `guardCompletion` / `guardTurnEnd` / `maxAttempts` / 套件数量） |
+| `/audit` | 查看当前开关状态与审计配置 |
 | `/audit-toggle [on\|off]` | 开/关总开关；不带参数则翻转 |
-
-```
-/audit             # → Audit gate: enabled: true, guardTurnEnd: modified, …
-/audit-toggle off  # → 关闭自动闸门（run_audit 手动工具仍可用）
-/audit-toggle      # → 再翻转一次 = 重新打开
-```
-
-> Web 端可视化开关：DSH 的设置 UI 是 slot 驱动、由每个插件自带 client 半区渲染（`settings.general.item`
-> 或 `settings.section`）。当前本包提供 `/audit`、`/audit-toggle` 命令 + host 侧 settings 命名空间（热切换已就绪），
-> 若还要在设置页出现可点击的开关/下拉框，需再补一个 client 半区把该命名空间渲染成 schema 表单。
-
-每个 `commands[]` 项：
-
-| 键 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `name` | string | — | 失败摘要里显示的名称 |
-| `run` | string | — | shell 命令，以 `bash -c <run>` 执行 |
-| `timeoutMs` | int | executor 默认 | 单命令超时 |
-| `required` | bool | `true` | 失败是否阻断完成 |
-| `maxOutputChars` | int | `4000` | 反馈给模型的失败输出字符数（取尾部） |
 
 ---
 
 ## 4. 行为细节
 
-- **审计执行**：通过 `ctx.shell.resolve(...)` + `ctx.shell.run(...)`（`@deepseek-ai/dsh-shell` 执行器 seam），
-  走 DSH 的受管进程组、输出截断/溢出、超时/取消语义。`workdir` 取 `agent.session.header.cwd`。
+- **审计执行**：通过 `ctx.subagents.start(subagentProvider, ...)` 开一个廉价模型 subagent，
+  用 `outputSchema` 索取结构化裁决（`structured_output` 工具）。subagent 继承父级工作区作为 cwd，
+  自行生成并运行语言合适的检查命令，并审风格、查文档覆盖。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
-  turn 被中止时审计命令会被 kill。
+  turn 被中止时 subagent 会被 dispose。
+- **基础设施失败不卡任务**：subagent 未完成（`error`/`refusal`/`max-tokens`）或拿不到结构化裁决时，
+  返回一个 `required: false` 的「审计未完成，本轮不阻断」裁决，避免因审计基础设施故障把任务卡死。
 - **无进展检测**：闸门 (B) 对每次失败做「失败项+输出」指纹，若与上一轮一致（模型没实际改好），立即停止注入，避免空转。
-- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存；模型代码（`write`/`edit`/`bash`/`pwsh`）一有改动
-  （`dirtyVersion` 递增）缓存即失效，`turn/start` 也会清缓存。因此“先 `run_audit` 通过、再 `complete`”不会重复全量跑。
-- **反馈来源**：注入的消息 `source.kind = "plugin"`（非 `"user"`），因此不会被 goal 系统的
-  `hasDirectHumanInput` 误判为「人类直接输入」，不会意外获得本不该有的权限。
+- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存；模型代码一有改动
+  （`dirtyVersion` 递增）缓存即失效，`turn/start` 也会清缓存。审计是 LLM 往返，缓存让
+  「先 `run_audit` 通过、再 `complete`」不重复花钱。
+- **反馈来源**：注入的消息 `source.kind = "plugin"`（非 `"user"`），不会被 goal 系统误判为「人类直接输入」。
 - **生命周期**：监听器和 per-agent 状态随 fiber/agent 自动清理，无进程级残留副作用。
 
 ---
 
 ## 5. 局限与后续方向
 
-1. **goal 的“完成前拦截”是借 `tools/pre-execute` 实现的**（今天无需改内核即可工作，且语义正确）。
+1. **goal 的“完成前拦截”是借 `tools/pre-execute` 实现的**（无需改内核即可工作，且语义正确）。
    若希望更通用的“任何路径写 complete 都被拦”的钩子，可向 `@deepseek-ai/dsh-goal` 提议增加一个
-   `goal/pre-complete` waterfall 事件，插件改为监听该事件即可。
-2. **写产物类检查**（如 `build`）受部署 sandbox/文件策略约束；若部署为只读，写产物命令会被策略拒绝，
-   可改用只读检查（`--noEmit`、`lint`、`test`）。
-3. **结构化到文件/行号级**：当前 `run_audit` 报告与 gate 反馈是「检查项 + 退出码 + 输出摘要」；
-   可进一步解析 lint/test 输出为 `文件 / 行号 / 修复建议` 的结构化 JSON，供模型更精准修复。
+   `goal/pre-complete` waterfall 事件。
+2. **审计成本与延迟**：每次全新审计都要一次 subagent 往返（生成检查 + 执行）。廉价模型让成本可控；
+   缓存缓解重复触发。若某个检查命令很慢（如全量 build），可后续把“生成检查计划”单独缓存复用。
+3. **写产物类检查**（如 `build`）受部署 sandbox/文件策略约束；若部署为只读，写产物命令会被策略拒绝，
+   可让审计 subagent 改用只读检查（`--noEmit`、`lint`、`test`）。
+4. **结构化到文件/行号级**：审计 subagent 的裁决已经要求 `detail` 带 `file:line`；未来可进一步要求
+   输出标准化的修复建议 JSON，供模型更精准修复。
 
 ---
 
@@ -205,8 +192,8 @@ audit-gate:
 
 ```
 dsh-audit-gate/
-├── package.json          # 包清单
-├── lib/index.js          # 插件本体（audit runner + 两个 gate）
+├── package.json          # 包清单（peer deps：cordis / dsh-llm / dsh-tools / dsh-settings）
+├── lib/index.js          # 插件本体（语言检测 + 廉价 subagent 审计执行器 + 两个 gate）
 ├── example.cordis.yml    # 示例组合行
 └── README.md
 ```
