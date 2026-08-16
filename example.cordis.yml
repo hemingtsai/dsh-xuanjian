@@ -26,5 +26,6 @@
     subagentProvider: spawn          # subagent provider to spawn the audit with
     checkStyle: true                 # have the audit review code style
     checkLogic: true                 # have the audit hunt for real logic bugs
+    checkFunction: true              # have the audit verify the requested functionality works
     checkDocs: true                  # have the audit check documentation coverage
     # styleGuide: .editorconfig      # optional style-guide file (absolute or workspace-relative)

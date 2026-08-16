@@ -4,7 +4,8 @@
 
 - **审计 = 自动生成**：按项目语言，由审计 subagent 自己生成并运行合适的检查（lint / typecheck / test / build / 等价命令）。
 - **找茬式逻辑审计**：审计 subagent 会真正**读源码**，按 git 变更优先揪真实 bug（越界/空指针/竞态/未处理异步/资源泄漏/错误处理缺口/安全问题），每条带 `file:line` 证据；宁缺毋滥。
-- **廉价模型**：审计 subagent 默认用 `deepseek-v4-flash`（远便宜于任务的 `deepseek-v4-pro`），一次 LLM 往返完成「生成检查 + 跑检查 + 审风格 + 找逻辑茬 + 查文档覆盖」。
+- **功能审计**：审计 subagent 会拿任务的**真实需求**（最近的用户请求 / goal objective）来验证「要实现的功能是否真的按需求跑通了」——能跑就跑起来实际用一遍，不能跑就核对链路完整性，抓「没实现/半实现/行为与需求不符/一用就崩」。
+- **廉价模型**：审计 subagent 默认用 `deepseek-v4-flash`（远便宜于任务的 `deepseek-v4-pro`），一次 LLM 往返完成「生成检查 + 跑检查 + 审风格 + 找逻辑茬 + 功能验证 + 查文档覆盖」。
 - **反馈修复** = 失败输出自动回到模型当前 turn，模型继续改，改完 gate 自动重跑。
 - **结束门槛** = 只要还有必选检查失败，任务就不能真正结束（受 `maxAttempts` 与「无进展指纹」双重兜底）。
 
@@ -33,7 +34,7 @@ DSH 里「任务完成」有两个落地信号，本插件对应两个互补的�
                     agentOptions: { model: auditModel },   // 默认 deepseek-v4-flash
                     outputSchema: verdict,                  // 结构化裁决
                   })   ──>  审计 subagent：生成检查并执行
-                             + 审代码风格 + 找逻辑茬 + 查文档覆盖
+                             + 审代码风格 + 找逻辑茬 + 功能验证 + 查文档覆盖
 ```
 
 ### (A) 目标类任务的「完成闸门」（精确、保语义）
@@ -106,6 +107,7 @@ npm install <this-package>
     subagentProvider: spawn
     checkStyle: true
     checkLogic: true
+    checkFunction: true
     checkDocs: true
     # styleGuide: .editorconfig   # 可选：绝对路径或相对工作区的风格指南文件
 ```
@@ -132,6 +134,7 @@ npm install <this-package>
 | `subagentProvider` | string | `spawn` | 审计 subagent 的 provider 名 |
 | `checkStyle` | bool | `true` | 审计是否审代码风格 |
 | `checkLogic` | bool | `true` | 审计是否做找茬式逻辑审计（读源码揪真实 bug） |
+| `checkFunction` | bool | `true` | 审计是否做功能审计（拿任务需求验证功能真能跑通） |
 | `checkDocs` | bool | `true` | 审计是否查文档覆盖 |
 | `styleGuide` | string | — | 可选风格指南文件（绝对或相对工作区）；存在则注入审计 prompt |
 
@@ -163,11 +166,14 @@ audit-gate:
 
 - **审计执行**：通过 `ctx.subagents.start(subagentProvider, ...)` 开一个廉价模型 subagent，
   用 `outputSchema` 索取结构化裁决（`structured_output` 工具）。subagent 继承父级工作区作为 cwd，
-  自行生成并运行语言合适的检查命令，并审风格、找逻辑茬、查文档覆盖。
+  自行生成并运行语言合适的检查命令，并审风格、找逻辑茬、做功能验证、查文档覆盖。
 - **找茬式逻辑审计**：审计 subagent 会真正阅读源码，按「本任务改了什么」优先（git 仓库下用
   `git status --short` / `git diff` / `git diff --cached` 定位变更文件），针对性地找越界、
   空指针/类型假设、竞态、未处理异步拒绝、资源泄漏、算法/契约不符、错误处理缺口、安全问题等真实缺陷，
   每条以 `file:line` 举证；明确「宁缺毋滥」，不编造问题凑数。
+- **功能审计**：审计 subagent 收到任务的真实需求上下文（最近的直接用户请求 + goal objective，由插件从
+  session 提取，插件注入的系统快照不计入），按需求验证功能是否真的实现并跑通——能跑就跑起来实际用一遍
+  （服务/CLI 限生命周期、用完杀掉），不能跑就核对链路是否完整接通；只抓「需求要求却没做到」的硬伤。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
   turn 被中止时 subagent 会被 dispose。
 - **基础设施失败不卡任务**：subagent 未完成（`error`/`refusal`/`max-tokens`）或拿不到结构化裁决时，
