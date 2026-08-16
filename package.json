@@ -1,6 +1,6 @@
 {
   "name": "dsh-audit-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness completion gate: full code audit + verification before a task can finish, with automatic feedback and fix loops.",
   "type": "module",
   "main": "lib/index.js",

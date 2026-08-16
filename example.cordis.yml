@@ -25,5 +25,6 @@
     auditModel: deepseek-v4-flash    # cheap model that performs the audit
     subagentProvider: spawn          # subagent provider to spawn the audit with
     checkStyle: true                 # have the audit review code style
+    checkLogic: true                 # have the audit hunt for real logic bugs
     checkDocs: true                  # have the audit check documentation coverage
     # styleGuide: .editorconfig      # optional style-guide file (absolute or workspace-relative)
