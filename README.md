@@ -2,12 +2,14 @@
 
 一个 DeepSeek Harness（DSH）插件：**当模型声称「任务完成」时，先用廉价模型 subagent 对代码做全量审计；审计不通过就把失败信息反馈给模型让它修复，修复后再审计，直到通过才真正结束这个 task。**
 
+**可信性承诺：审计只有三种结果——`passed` / `failed` / `inconclusive`，其中「审计没跑成」永远不会被报告成通过。默认（`onInconclusive: deny`）下，审计不明确通过，任务就不能完成。** 整体裁决由宿主从每条检查证据推导，模型无权自报顶层 `passed`。
+
 - **审计 = 自动生成**：按项目语言，由审计 subagent 自己生成并运行合适的检查（lint / typecheck / test / build / 等价命令）。
 - **找茬式逻辑审计**：审计 subagent 会真正**读源码**，按 git 变更优先揪真实 bug（越界/空指针/竞态/未处理异步/资源泄漏/错误处理缺口/安全问题），每条带 `file:line` 证据；宁缺毋滥。
 - **功能审计**：审计 subagent 会拿任务的**真实需求**（最近的用户请求 / goal objective）来验证「要实现的功能是否真的按需求跑通了」——能跑就跑起来实际用一遍，不能跑就核对链路完整性，抓「没实现/半实现/行为与需求不符/一用就崩」。
 - **廉价模型**：审计 subagent 默认用 `deepseek-v4-flash`（远便宜于任务的 `deepseek-v4-pro`），一次 LLM 往返完成「生成检查 + 跑检查 + 审风格 + 找逻辑茬 + 功能验证 + 查文档覆盖」。
 - **反馈修复** = 失败输出自动回到模型当前 turn，模型继续改，改完 gate 自动重跑。
-- **结束门槛** = 只要还有必选检查失败，任务就不能真正结束（受 `maxAttempts` 与「无进展指纹」双重兜底）。
+- **结束门槛** = 只有审计 `passed` 任务才真正结束；`failed` 必拒；`inconclusive` 默认也拒（`onInconclusive` 可放宽为 `warn`/`allow`）。
 
 ---
 
@@ -43,8 +45,9 @@ DSH 的目标系统里，模型用 `update_goal`（action `complete`）宣布完
 `tools/pre-execute`（waterfall，可异步），当工具是 `update_goal` 且 action 为 `complete` 时：
 
 1. 先跑完整审计（`await`，阻塞在工具执行前）。
-2. 全部检查通过 → `next()`，放行，goal 正常进入 `complete`。
-3. 有失败 → 返回 `{ kind: "deny", reason: <失败摘要> }`，工具调用被拒绝，goal **不会被标记 complete**。
+2. 审计 `passed` → `next()`，放行，goal 正常进入 `complete`。
+3. 审计 `failed` → 返回 `{ kind: "deny", reason: <失败摘要> }`，工具调用被拒绝，goal **不会被标记 complete**。
+4. 审计 `inconclusive` → 按 `onInconclusive`：默认 `deny`（拒绝并说明「审计未完成，不允许在未验证的情况下完成」）；`warn`/`allow` 则放行但报告/日志保留告警。
 
 模型看到 `update_goal` 返回错误（含失败明细），继续修复，再重试 `complete`。
 
@@ -102,6 +105,7 @@ npm install <this-package>
   config:
     guardTurnEnd: modified      # off | modified | always
     maxAttempts: 5
+    onInconclusive: deny        # deny | warn | allow —— 审计未完成时的默认策略
     auditProvider: deepseek-official
     auditModel: deepseek-v4-flash
     subagentProvider: spawn
@@ -124,7 +128,8 @@ npm install <this-package>
 | `enabled` | bool | `true` | 总开关（**运行时热切换**） |
 | `guardCompletion` | bool | `true` | 闸门 (A)：拒绝未通过审计的 `update_goal complete`（**运行时热切换**） |
 | `guardTurnEnd` | `off\|modified\|always` | `modified` | 闸门 (B)：turn 结束审计的触发条件（**运行时热切换**） |
-| `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示（**运行时热切换**） |
+| `maxAttempts` | int | `5` | (B) 每个 turn 最多注入几次修复提示（**运行时热切换**；1/2/5 行为有精确测试） |
+| `onInconclusive` | `deny\|warn\|allow` | `deny` | 审计无法完成（subagent 报错/拒绝/超 token/结构化缺失/空检查等）时的策略：`deny` 阻断完成（默认，推荐）、`warn` 放行但保留告警、`allow` 放行 |
 | `workdir` | string | agent cwd | 审计工作目录覆盖 |
 | `mutatingTools` | string[] | `write,edit,bash,pwsh` | `modified` 触发判定 + 缓存失效判定用到的“会改文件”工具名 |
 | `registerTool` | bool | `true` | 是否注册 (C) 主动验证工具 |
@@ -175,14 +180,21 @@ audit-gate:
   session 提取，插件注入的系统快照不计入），按需求验证功能是否真的实现并跑通——能跑就跑起来实际用一遍
   （服务/CLI 限生命周期、用完杀掉），不能跑就核对链路是否完整接通；只抓「需求要求却没做到」的硬伤。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
-  turn 被中止时 subagent 会被 dispose。
+  turn 被中止时 subagent 会被 dispose，且中止结果不会被缓存。
+- **三态结果，绝不伪装通过**：审计只产出 `passed` / `failed` / `inconclusive`。`inconclusive` 覆盖
+  subagent 启动失败、`run.result` 拒绝、`error`/`max-tokens`/`refusal`/异常 stopReason、结构化输出缺失
+  或非法、以及**空检查列表**（无证据不构成通过）。顶层整体裁决由宿主从每条检查推导，模型输出的顶层
+  `passed` 字段被移除且不被信任——模型说通过了、但它的每条检查都失败时，结果是 `failed`。
 - **瞬时故障自动重试**：审计 subagent 若以 `error`/`max-tokens` 结束（API 传输抖动等基础设施问题），
-  插件会间隔 1.2s 重开一次；两次都失败才返回 `required: false` 的「本轮不阻断」裁决，避免审计基础设施故障把任务卡死。
+  插件会间隔 1.2s 重开一次；两次都失败才判定 `inconclusive`（默认阻断，见 `onInconclusive`）。
   `refusal`（模型拒绝）不重试。
 - **无进展检测**：闸门 (B) 对每次失败做「失败项+输出」指纹，若与上一轮一致（模型没实际改好），立即停止注入，避免空转。
-- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存；模型代码一有改动
-  （`dirtyVersion` 递增）缓存即失效，`turn/start` 也会清缓存。审计是 LLM 往返，缓存让
+- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存（已完成结果 + in-flight
+  single-flight：并发触发只开一个 subagent）；**任何 mutating 工具的结果——无论成功失败——都使缓存失效**
+  （一条失败的命令也可能在报错前已改动文件），`turn/start` 也会清缓存。审计是 LLM 往返，缓存让
   「先 `run_audit` 通过、再 `complete`」不重复花钱。
+- **goal 判定**：只有 `active` 的 goal 才让位给完成闸门 (A)；`complete`/`paused`/`blocked` 的旧 goal
+  不会让后续普通任务绕过 turn 结束闸门 (B)。
 - **反馈来源**：注入的消息 `source.kind = "plugin"`（非 `"user"`），不会被 goal 系统误判为「人类直接输入」。
 - **生命周期**：监听器和 per-agent 状态随 fiber/agent 自动清理，无进程级残留副作用。
 
@@ -199,6 +211,14 @@ audit-gate:
    可让审计 subagent 改用只读检查（`--noEmit`、`lint`、`test`）。
 4. **结构化到文件/行号级**：审计 subagent 的裁决已经要求 `detail` 带 `file:line`；未来可进一步要求
    输出标准化的修复建议 JSON，供模型更精准修复。
+5. **命令执行隔离**：目前审计 subagent 直接持有通用 `bash`，靠 prompt 约束「只读/只写临时区」。更严格的
+   做法是宿主掌握受控命令执行器（argv 而非 shell 字符串、临时 worktree、安全环境变量、单命令超时、
+   进程组清理、真实证据记录），并让模型只输出检查计划——见「局限与后续方向」第 3 条同层的 roadmap。
+6. **审计证明（certificate）与最终 guard**：当前完成拦截借 `tools/pre-execute`，后续可引入
+   `ctx.tools.guard()` 同步校验「当前工作区/任务/配置对应的审计通过证明」，做成不可被重排撤销的不变量。
+7. **测试与 CI**：仓库内置 `node --test` 测试（`test/unit.test.mjs` 纯逻辑 + `test/gate.test.mjs` 事件
+   状态机），覆盖三态裁决、maxAttempts 精确计数、goal phase、缓存失效、single-flight、递归保护等；
+   CI 运行 `npm ci && npm run check && npm test && npm run pack:check`。
 
 ---
 

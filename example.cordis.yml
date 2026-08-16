@@ -13,6 +13,7 @@
     guardCompletion: true            # deny `update_goal` complete until verified
     guardTurnEnd: modified           # off | modified | always
     maxAttempts: 5
+    onInconclusive: deny             # deny | warn | allow —— block completion on an unverified audit by default
     registerTool: true               # register the model-facing `run_audit` tool
     toolName: run_audit
     # workdir: ~                     # optional override; defaults to the agent's cwd
