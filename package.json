@@ -14,7 +14,7 @@
   "author": "hemingtsai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hemingtsai/dsh-xuanjian.git"
+    "url": "git+https://github.com/hemingtsai/dsh-audit-gate.git"
   },
   "keywords": [
     "deepseek-harness",
