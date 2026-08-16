@@ -27,7 +27,7 @@ DSH 里「任务完成」有两个落地信号，本插件对应两个互补的�
                  └───────────────┬────────────────────────────┘
                                  │  runAuditCached(commands)
                                  ▼
-                    ctx.bash.run("npm run lint" | "npx tsc --noEmit" | "npm test" ...)
+                    ctx.shell.run("npm run lint" | "npx tsc --noEmit" | "npm test" ...)
 ```
 
 ### (A) 目标类任务的「完成闸门」（精确、保语义）
@@ -169,7 +169,7 @@ audit-gate:
 
 ## 4. 行为细节
 
-- **审计执行**：通过 `ctx.bash.resolve(...)` + `ctx.bash.run(...)`（`@deepseek-ai/dsh-shell` 执行器 seam），
+- **审计执行**：通过 `ctx.shell.resolve(...)` + `ctx.shell.run(...)`（`@deepseek-ai/dsh-shell` 执行器 seam），
   走 DSH 的受管进程组、输出截断/溢出、超时/取消语义。`workdir` 取 `agent.session.header.cwd`。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
   turn 被中止时审计命令会被 kill。
