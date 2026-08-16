@@ -176,8 +176,9 @@ audit-gate:
   （服务/CLI 限生命周期、用完杀掉），不能跑就核对链路是否完整接通；只抓「需求要求却没做到」的硬伤。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
   turn 被中止时 subagent 会被 dispose。
-- **基础设施失败不卡任务**：subagent 未完成（`error`/`refusal`/`max-tokens`）或拿不到结构化裁决时，
-  返回一个 `required: false` 的「审计未完成，本轮不阻断」裁决，避免因审计基础设施故障把任务卡死。
+- **瞬时故障自动重试**：审计 subagent 若以 `error`/`max-tokens` 结束（API 传输抖动等基础设施问题），
+  插件会间隔 1.2s 重开一次；两次都失败才返回 `required: false` 的「本轮不阻断」裁决，避免审计基础设施故障把任务卡死。
+  `refusal`（模型拒绝）不重试。
 - **无进展检测**：闸门 (B) 对每次失败做「失败项+输出」指纹，若与上一轮一致（模型没实际改好），立即停止注入，避免空转。
 - **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存；模型代码一有改动
   （`dirtyVersion` 递增）缓存即失效，`turn/start` 也会清缓存。审计是 LLM 往返，缓存让
