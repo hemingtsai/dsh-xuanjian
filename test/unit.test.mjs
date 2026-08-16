@@ -12,8 +12,11 @@ import {
   reportValue,
   renderDenialReason,
   renderFeedback,
-  fingerprint,
   VERDICT_SCHEMA,
+  ALLOWED_EXECUTABLES,
+  resolveExecutableArgv,
+  mergeEvidence,
+  workspaceState,
 } from "../lib/index.js";
 
 test("resolveConfig: defaults and validation", () => {
@@ -104,13 +107,49 @@ test("renderFeedback shows the correct phase and attempt count", () => {
   assert.match(inconclusive[0].text, /inconclusive/);
 });
 
-test("fingerprint only includes non-passed checks", () => {
-  const fp = fingerprint({ checks: [
-    { name: "ok", status: "passed", output: "x" },
-    { name: "bad", status: "failed", output: "y" },
-  ] });
-  assert.ok(fp.includes("bad"));
-  assert.ok(!fp.includes("ok"));
+test("resolveExecutableArgv: allowlists runners and confines file paths", () => {
+  const wd = "/tmp/repo";
+  assert.deepEqual(resolveExecutableArgv(wd, "npm-script", "test", []), ["npm", "run", "test"]);
+  assert.deepEqual(resolveExecutableArgv(wd, "executable", "ruff", ["check", "."]), ["ruff", "check", "."]);
+  assert.throws(() => resolveExecutableArgv(wd, "executable", "evil-binary", []), /allowlist/);
+  assert.throws(() => resolveExecutableArgv(wd, "npm-script", "test && rm -rf /", []), /invalid npm script/);
+  assert.throws(() => resolveExecutableArgv(wd, "shell", "bash", []), /unknown runner/);
+  assert.throws(() => resolveExecutableArgv(wd, "file", "../outside", []), /escapes/);
+  assert.throws(() => resolveExecutableArgv(wd, "file", "/abs/path", []), /relative/);
+  const fileArgv = resolveExecutableArgv(wd, "file", "bin/tool", []);
+  assert.equal(fileArgv[0], "/tmp/repo/bin/tool");
+  assert.ok(ALLOWED_EXECUTABLES.has("pytest"));
+});
+
+test("mergeEvidence: host exit code overrides the model's restatement", () => {
+  const model = {
+    status: "passed",
+    summary: "s",
+    checks: [
+      { name: "lint", run: "llm-audit", status: "passed", output: "" },
+      { name: "style", run: "llm-audit", status: "failed", output: "indent" },
+    ],
+  };
+  const evidence = [{ name: "lint", runner: "executable", argv: ["eslint", "."], exitCode: 1, passed: false, timedOut: false, outputTail: "boom", outputDigest: "x" }];
+  const merged = mergeEvidence(model, evidence);
+  assert.equal(merged.checks[0].status, "failed", "host evidence flips the model's pass to fail");
+  assert.equal(merged.checks[0].run, "audit:executable");
+  assert.equal(merged.status, "failed");
+});
+
+test("workspaceState (non-git walk) reflects file changes (self-modification detection)", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "audit-state-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "a.txt"), "one");
+  const ctx = {
+    subprocess: { spawn: () => ({ done: Promise.resolve({ exitCode: 1 }), collected: {} }) },
+  };
+  const before = await workspaceState(ctx, dir, undefined);
+  assert.equal(before.isGit, false);
+  await writeFile(join(dir, "a.txt"), "two");
+  const after = await workspaceState(ctx, dir, undefined);
+  assert.notEqual(after.stateDigest, before.stateDigest, "content change must change the digest");
+  assert.notEqual(after.modDigest, before.modDigest);
 });
 
 test("VERDICT_SCHEMA has no top-level passed field (host derives it)", () => {

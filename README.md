@@ -109,6 +109,9 @@ npm install <this-package>
     auditProvider: deepseek-official
     auditModel: deepseek-v4-flash
     subagentProvider: spawn
+    auditExecName: audit_exec   # 受控检查 runner（审计 subagent 用它代替 bash）
+    maxAuditTimeoutMs: 300000   # 单次审计总预算
+    commandTimeoutMs: 120000    # 单命令预算
     checkStyle: true
     checkLogic: true
     checkFunction: true
@@ -137,6 +140,10 @@ npm install <this-package>
 | `auditProvider` | string | `deepseek-official` | 审计 subagent 的 provider |
 | `auditModel` | string | `deepseek-v4-flash` | 审计 subagent 的廉价模型 |
 | `subagentProvider` | string | `spawn` | 审计 subagent 的 provider 名 |
+| `auditExecName` | string | `audit_exec` | 受控检查 runner 工具名（审计 subagent 用它代替 bash；runner 白名单 + argv + 环境清洗 + 超时 + 真实证据） |
+| `maxAuditTimeoutMs` | int | `300000` | 单次审计总墙钟预算，超时判 `inconclusive(deadline)` |
+| `commandTimeoutMs` | int | `120000` | `audit_exec` 单命令默认预算 |
+| `outputMaxChars` | int | `4000` | 证据输出保留的尾部字符数 |
 | `checkStyle` | bool | `true` | 审计是否审代码风格 |
 | `checkLogic` | bool | `true` | 审计是否做找茬式逻辑审计（读源码揪真实 bug） |
 | `checkFunction` | bool | `true` | 审计是否做功能审计（拿任务需求验证功能真能跑通） |
@@ -169,34 +176,47 @@ audit-gate:
 
 ## 4. 行为细节
 
+- **受控命令执行（无通用 bash）**：审计 subagent 的工具集被限制为 `read` / `glob` / `grep` + `audit_exec`
+  （`toolFilter: allow`），**不再暴露通用 bash**。`audit_exec` 由宿主执行：
+  - runner 白名单：`npm-script`（package.json 脚本名）/ `executable`（允许列表如 ruff、pytest、tsc、go、
+    cargo、dotnet、make…）/ `file`（工作区内相对可执行路径，做路径围栏）；
+  - 一律 **argv 拼接，无 shell**；环境变量**剔除密钥/凭据**（API_KEY/TOKEN/SECRET/PASSWORD/云凭据等）；
+  - 单命令超时、detached 进程组清理、输出字节上限；
+  - 返回**宿主记录的证据**（argv、退出码、时长、输出摘要、输出 digest），写入按 agent 的证据池。
 - **审计执行**：通过 `ctx.subagents.start(subagentProvider, ...)` 开一个廉价模型 subagent，
   用 `outputSchema` 索取结构化裁决（`structured_output` 工具）。subagent 继承父级工作区作为 cwd，
-  自行生成并运行语言合适的检查命令，并审风格、找逻辑茬、做功能验证、查文档覆盖。
-- **找茬式逻辑审计**：审计 subagent 会真正阅读源码，按「本任务改了什么」优先（git 仓库下用
-  `git status --short` / `git diff` / `git diff --cached` 定位变更文件），针对性地找越界、
-  空指针/类型假设、竞态、未处理异步拒绝、资源泄漏、算法/契约不符、错误处理缺口、安全问题等真实缺陷，
-  每条以 `file:line` 举证；明确「宁缺毋滥」，不编造问题凑数。
-- **功能审计**：审计 subagent 收到任务的真实需求上下文（最近的直接用户请求 + goal objective，由插件从
-  session 提取，插件注入的系统快照不计入），按需求验证功能是否真的实现并跑通——能跑就跑起来实际用一遍
-  （服务/CLI 限生命周期、用完杀掉），不能跑就核对链路是否完整接通；只抓「需求要求却没做到」的硬伤。
+  提出并执行检查计划、审风格、找逻辑茬、做功能验证、查文档覆盖。**最终裁决合并宿主证据**：凡是
+  `audit_exec` 跑过的检查，其 pass/fail 由宿主退出码决定，模型的重述不能覆盖。
+- **总预算与自修改检测**：单次审计有 `maxAuditTimeoutMs` 墙钟预算，超时判 `inconclusive(deadline)`；
+  审计前后各做一次工作区快照（git HEAD+diff / 有界文件 walk），若审计过程修改了工作区 → 判
+  `inconclusive(self-modified)`，其裁决不被信任。
+- **找茬式逻辑审计**：审计 subagent 会真正阅读源码，按宿主注入的「changed files」（git status）优先，
+  找越界、空指针/类型假设、竞态、未处理异步拒绝、资源泄漏、算法/契约不符、错误处理缺口、安全问题等
+  真实缺陷，每条以 `file:line` 举证；宁缺毋滥。
+- **功能审计**：审计 subagent 收到任务的真实需求上下文（最近的直接用户请求 + goal objective，插件注入的
+  系统快照不计入），按需求验证功能是否真的实现并跑通（通过 `audit_exec` 运行程序/测试）；只抓硬伤。
 - **取消**：审计全程观察 `AbortSignal`（闸门 (A) 用 `exec.signal`，闸门 (B) 用 `turn-stopping` 的 `signal`），
   turn 被中止时 subagent 会被 dispose，且中止结果不会被缓存。
 - **三态结果，绝不伪装通过**：审计只产出 `passed` / `failed` / `inconclusive`。`inconclusive` 覆盖
   subagent 启动失败、`run.result` 拒绝、`error`/`max-tokens`/`refusal`/异常 stopReason、结构化输出缺失
-  或非法、以及**空检查列表**（无证据不构成通过）。顶层整体裁决由宿主从每条检查推导，模型输出的顶层
-  `passed` 字段被移除且不被信任——模型说通过了、但它的每条检查都失败时，结果是 `failed`。
+  或非法、**空检查列表**、总预算超时、以及审计自改工作区。顶层整体裁决由宿主从每条检查推导，模型输出
+  的顶层 `passed` 字段被移除且不被信任。
 - **瞬时故障自动重试**：审计 subagent 若以 `error`/`max-tokens` 结束（API 传输抖动等基础设施问题），
-  插件会间隔 1.2s 重开一次；两次都失败才判定 `inconclusive`（默认阻断，见 `onInconclusive`）。
-  `refusal`（模型拒绝）不重试。
-- **无进展检测**：闸门 (B) 对每次失败做「失败项+输出」指纹，若与上一轮一致（模型没实际改好），立即停止注入，避免空转。
-- **结果缓存**：闸门 (A/B) 与 `run_audit` 工具共享同一个 per-agent 缓存（已完成结果 + in-flight
-  single-flight：并发触发只开一个 subagent）；**任何 mutating 工具的结果——无论成功失败——都使缓存失效**
-  （一条失败的命令也可能在报错前已改动文件），`turn/start` 也会清缓存。审计是 LLM 往返，缓存让
-  「先 `run_audit` 通过、再 `complete`」不重复花钱。
+  插件会间隔 1.2s 重开一次；两次都失败才判定 `inconclusive`（默认阻断，见 `onInconclusive`）。`refusal` 不重试。
+- **审计证书 + 单调 guard**：审计 `passed` 后签发一张绑定「工作区/任务/目标/配置快照」的短期证书；
+  `ctx.tools.guard()`（在**所有** `tools/pre-execute` 层之后执行、且后续监听器无法放行）对
+  `update_goal complete` 做同步校验：无证书、或证书 dirtyVersion 与当前不一致、或证书状态为
+  `inconclusive` 且 `onInconclusive: deny` → 拒绝。完成不变量因此不可被监听器重排绕过。
+- **无进展检测（按工作区快照）**：闸门 (B) 比较上一轮 steered 时与当前的工作区 digest；模型改了代码
+  （digest 变化）才继续注入，否则视为无进展、停止，避免空转。
+- **结果缓存（快照键 + single-flight）**：闸门 (A/B) 与 `run_audit` 工具共享 per-agent 缓存，键 =
+  「工作区快照 digest + 任务上下文 digest + goal ref + 审计配置 digest」；同一键并发触发只开一个
+  subagent；`audit_exec`/bash 等 mutating 工具（无论成败）使证书失效，`turn/start` 清缓存。审计是
+  LLM 往返，缓存让「先 `run_audit` 通过、再 `complete`」不重复花钱。
 - **goal 判定**：只有 `active` 的 goal 才让位给完成闸门 (A)；`complete`/`paused`/`blocked` 的旧 goal
   不会让后续普通任务绕过 turn 结束闸门 (B)。
 - **反馈来源**：注入的消息 `source.kind = "plugin"`（非 `"user"`），不会被 goal 系统误判为「人类直接输入」。
-- **生命周期**：监听器和 per-agent 状态随 fiber/agent 自动清理，无进程级残留副作用。
+- **生命周期**：监听器、per-agent 状态、证据池随 fiber/agent 自动清理，无进程级残留副作用。
 
 ---
 
@@ -204,20 +224,25 @@ audit-gate:
 
 1. **goal 的“完成前拦截”是借 `tools/pre-execute` 实现的**（无需改内核即可工作，且语义正确）。
    若希望更通用的“任何路径写 complete 都被拦”的钩子，可向 `@deepseek-ai/dsh-goal` 提议增加一个
-   `goal/pre-complete` waterfall 事件。
-2. **审计成本与延迟**：每次全新审计都要一次 subagent 往返（生成检查 + 执行）。廉价模型让成本可控；
-   缓存缓解重复触发。若某个检查命令很慢（如全量 build），可后续把“生成检查计划”单独缓存复用。
+   `goal/pre-complete` waterfall 事件。当前完成的**不可撤销**由 `ctx.tools.guard()` + 审计证书兜底。
+2. **审计成本与延迟**：每次全新审计都要一次 subagent 往返。廉价模型让成本可控；快照键缓存缓解重复触发。
+   更彻底的「三层架构」（模型只输出检查计划 → 宿主在临时 worktree 执行 → 模型读证据做语义审查）可进一步
+   减少审计对工作区的接触面，代价是多一次 LLM 往返 + 计划可靠性成本。
 3. **写产物类检查**（如 `build`）受部署 sandbox/文件策略约束；若部署为只读，写产物命令会被策略拒绝，
-   可让审计 subagent 改用只读检查（`--noEmit`、`lint`、`test`）。
+   审计 subagent 可用 `audit_exec` 改跑只读检查（`--noEmit`、`lint`、`test`）。当前检查命令直接在宿主
+   工作区执行，靠「审计前后快照比对」把自修改判为 `inconclusive`；真正的临时 worktree / 只读源码副本
+   是进一步加固方向（对需要 `node_modules` 的项目复制成本高，故默认未启用）。
 4. **结构化到文件/行号级**：审计 subagent 的裁决已经要求 `detail` 带 `file:line`；未来可进一步要求
    输出标准化的修复建议 JSON，供模型更精准修复。
-5. **命令执行隔离**：目前审计 subagent 直接持有通用 `bash`，靠 prompt 约束「只读/只写临时区」。更严格的
-   做法是宿主掌握受控命令执行器（argv 而非 shell 字符串、临时 worktree、安全环境变量、单命令超时、
-   进程组清理、真实证据记录），并让模型只输出检查计划——见「局限与后续方向」第 3 条同层的 roadmap。
-6. **审计证明（certificate）与最终 guard**：当前完成拦截借 `tools/pre-execute`，后续可引入
-   `ctx.tools.guard()` 同步校验「当前工作区/任务/配置对应的审计通过证明」，做成不可被重排撤销的不变量。
+5. **命令执行隔离已落地到「宿主受控 + 证据 + 自修改检测」**：审计 subagent 无通用 bash，只有 `audit_exec`
+   （runner 白名单 / argv / 环境清洗 / 超时 / 进程组清理 / 输出上限 / 真实证据）。剩余的差距是
+   「临时 worktree / 只读源码副本」和「计划-执行-审查三层拆分」，见第 2 条。
+6. **审计证书 + 单调 guard 已落地**：`ctx.tools.guard()` 同步校验证书（绑工作区/任务/目标/配置快照 +
+   dirtyVersion）；guard 是同步的，外部对工作区的非工具修改（IDE/钩子）会在下一次 pre-execute 因快照键
+   不一致而强制重审，但 guard 本身只能做廉价同步检查。
 7. **测试与 CI**：仓库内置 `node --test` 测试（`test/unit.test.mjs` 纯逻辑 + `test/gate.test.mjs` 事件
-   状态机），覆盖三态裁决、maxAttempts 精确计数、goal phase、缓存失效、single-flight、递归保护等；
+   状态机），覆盖三态裁决、maxAttempts 精确计数、goal phase、快照缓存、single-flight、递归保护、
+   证书 guard、runner 白名单/路径围栏、证据合并、自修改 digest 等；
    CI 运行 `npm ci && npm run check && npm test && npm run pack:check`。
 
 ---
@@ -226,8 +251,9 @@ audit-gate:
 
 ```
 dsh-audit-gate/
-├── package.json          # 包清单（peer deps：cordis / dsh-llm / dsh-tools / dsh-settings）
-├── lib/index.js          # 插件本体（语言检测 + 廉价 subagent 审计执行器 + 两个 gate）
+├── package.json          # 包清单（peer deps：cordis / dsh-llm / dsh-tools / dsh-settings / dsh-timeout / dsh-subprocess）
+├── lib/index.js          # 插件本体（语言检测 + 受控 audit_exec 执行器 + 快照缓存 + 审计证书/guard + 两个 gate）
+├── test/                 # node:test 单元 + 事件状态机测试
 ├── example.cordis.yml    # 示例组合行
 └── README.md
 ```
